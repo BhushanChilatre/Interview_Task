@@ -1,0 +1,157 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+  - vpc_region: us-east-1
+  - my_useast1_key: mykeypair
+
+  tasks:
+  - name: creating VPC
+    ec2_vpc_net:
+      name: MyVPC
+      state: present
+      cidr_block: 10.0.0.0/16
+      region: "{{ vpc_region }}"
+    register: MyVPC
+      
+  - name: display MyVPC results
+    debug: var=MyVPC
+
+  - name: creating internet gateway for MyVPC
+    ec2_vpc_igw:
+      state: present
+      region: "{{ vpc_region }}"
+      vpc_id: "{{ MyVPC.vpc.id }}"
+      tags:
+        Name: MyVPC_IGW
+    register: MyVPC_igw
+
+  - name: display MyVPC IGW details
+    debug: var=MyVPC_igw
+
+  - name: obtain all AZ present in region {{ vpc_region }}
+    aws_az_facts:
+      region: "{{ vpc_region }}"
+    register: az_in_region
+
+  - name: display all AZ present in region {{ vpc_region }}
+    debug: var=az_in_region
+
+  - name: display AZ that will be used for public and private Subnets
+    debug:
+      msg:
+        - "public subnet in AZ: {{ az_in_region.availability_zones[0].zone_name }}"
+        - "private subnet in AZ: {{ az_in_region.availability_zones[1].zone_name }}"
+
+  - name: creating public subnet in AZ {{ az_in_region.availability_zones[0].zone_name }}
+    ec2_vpc_subnet:
+      state: present
+      cidr: 10.0.1.0/24
+      az: "{{ az_in_region.availability_zones[0].zone_name }}"
+      vpc_id: "{{ MyVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      map_public: yes
+      tags:
+        Name: public subnet
+    register: public_subnet
+
+  - name: show public subnet details
+    debug: var=public_subnet
+
+  - name: creating private subnet in AZ {{ az_in_region.availability_zones[1].zone_name }}
+    ec2_vpc_subnet:
+      state: present
+      cidr: 10.0.2.0/24
+      az: "{{ az_in_region.availability_zones[1].zone_name }}"
+      vpc_id: "{{ MyVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      resource_tags:
+        Name: private subnet
+    register: private_subnet
+
+  - name: show private subnet details
+    debug:  var=private_subnet
+
+  - name: creating new route table for public subnet
+    ec2_vpc_route_table:
+      state: present
+      region: "{{ vpc_region }}"
+      vpc_id: "{{ MyVPC.vpc.id }}"
+      tags:
+        Name: rt_MyVPC_PublicSubnet
+      subnets:
+        - "{{ public_subnet.subnet.id }}"
+      routes:
+        - dest: 0.0.0.0/0
+          gateway_id: "{{ MyVPC_igw.gateway_id }}"
+    register: rt_MyVPC_PublicSubnet
+    
+  - name: display public route table
+    debug: var=rt_MyVPC_PublicSubnet
+
+  - name: creating a security group
+    ec2_group:
+      state: present
+      name: sg_MyVPC
+      description: security group for webservers within the public subnet of My VPC
+      vpc_id: "{{ MyVPC.vpc.id }}"
+      region: "{{ vpc_region }}"
+      rules:
+        - proto: tcp
+          ports:
+            - 80
+          cidr_ip: 0.0.0.0/0
+          rule_desc: allow all on port 80
+    register: sg_MyVPC
+
+  - name: display details for security group
+    debug: var=sg_MyVPC
+
+  - name: creating load balancer
+    ec2_elb_lb:
+        name: awslb
+        state: present
+        region: "{{ vpc_region }}"
+        listeners:
+          - protocol: http
+            load_balancer_port: 80
+            instance_port: 80
+        tags:
+          name: aws_elb
+        subnets: "{{ public_subnet.subnet.id }}"
+        health_check:
+          ping_protocol: http
+          ping_port: 80
+          ping_path: "/index.html"
+          response_timeout: 5
+          interval: 30
+          unhealthy_threshold: 2
+          healthy_threshold: 2
+
+  - name: Creating NAT gateway
+    ec2_vpc_nat_gateway:
+       state: present
+       subnet_id: "{{ private_subnet.subnet.id }}"
+       wait: true
+       region: "{{ vpc_region }}"
+    register: new_nat_gateway
+
+  - name: Creating Ec2 instances in private subnet
+    ec2:
+      key_name: "{{ my_useast1_key }}"
+      instance_type: t2.micro
+      image: ami-0be2609ba883822ec
+      group_id: "{{ sg_MyVPC.group_id }}"
+      vpc_subnet_id: "{{ private_subnet.subnet.id }}"
+      assign_public_ip: no
+      region: "{{ vpc_region }}"
+      instance_tags:
+        Name: webserver
+      count_tag:
+        Name: webserver
+      exact_count: 3
+    register: webserver
+
+  - name: display details for all server in private subnet
+    debug: var=webserver
